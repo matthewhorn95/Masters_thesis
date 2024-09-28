@@ -1,0 +1,914 @@
+---
+title: "Thesis_modelling"
+author: "Matthew Horn"
+date: "2024-02-18"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## NOTE: if you are using my work, either remove the path to thesis in all of the file paths if you can get setwd to work and use the relative paths, or use control F to replace my path to the Thesis folder with yours for all occurrences in each Rmd file.
+
+# Begin modeling of data as is with real censoring
+
+First, after loading necessary libraries, I will load the monitoring data for the moth dataset and extract the daily climate data from the rasters provided by the FMI (Finnish Meteorological Institute):
+
+```{r}
+# Loading the necessary libraries first
+library(reshape2)
+library(rstanarm)
+library(rstan)
+library(meteor)
+library(spatstat)
+library(raster)
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(sp)
+library(MASS)
+library(cowplot)
+library(tidyr)
+library(suncalc)
+library(rgdal)
+library(sf)
+library(terra)
+library(zoo)
+```
+
+
+
+```{r}
+# Load in the updated species data
+date_df = read.csv('/home/matthorn/Documents/Thesis/species_data/Moth_Monitoring_toRecbase_19072023.csv')
+date_df = date_df[date_df$Success == 1,]
+
+# Take years after 1997 for now (~5 days to rerun climate rasters)
+date_df = subset(date_df, Year >= 1998)
+
+# Compute the unique locations
+site_location = date_df %>%
+  distinct(SiteID, Latitude, Longitude)
+
+date_df$Date = as.Date(paste(date_df$Year, date_df$Month, date_df$Day, sep = "-"))
+date_df = date_df %>%
+  mutate(yday = yday(Date))
+
+# Get the first presences of each site-year combination
+first_pres = date_df %>%
+  group_by(SiteID, Year, Species) %>%
+  mutate(first_pres = min(yday)) %>%
+  distinct(Species, SiteID, Year, first_pres) %>%
+  mutate(yday = first_pres)
+
+print(first_pres)
+
+# Getting the unique coordinates and site ID's of the sampling locations for later
+unique_coords = unique(cbind(date_df$Longitude, date_df$Latitude))
+unique_site_coords_df = data.frame(unique(cbind(date_df$SiteID, date_df$Longitude, date_df$Latitude)))
+colnames(unique_site_coords_df) = c("SiteID", "Longitude", "Latitude")
+
+# Also get the first sampling times so we can use the real censoring process in the simulation study and modelling
+first_samplings = date_df %>%
+  group_by(Year, SiteID) %>%
+  summarise(first_sampling = min(yday), .groups = "drop")
+```
+
+
+First we need to identify a species or several to model.
+
+Let's look at, within a site, how the first observation time is changing over the years (relative to the first sampling time) for different species, as well as the portion of censoring for each species and overall. We wish to model a species with not too much censoring (maybe around 30 percent), one that is present in many sites, and one that has occurred in many years on average in a site (high ratio of site_years_present to sites_present). 
+
+Also, it would be more interesting to predict true first occurrence times for a species whose phenological trends might actually be different after the interpolation of these censored times with the predicted ones. So, a decreasing trend that might be hidden by sampling and not too great a distance between first observation and first sampling in the uncensored cases (which means not too high a variance in the first observation times):
+
+
+```{r}
+species_rel_min = date_df %>%
+  group_by(SiteID, Year) %>%
+  mutate(first_sampling_year_site = min(yday),
+         rel_first_obs = yday - first_sampling_year_site,
+        min_rel_first_obs_spec = min(rel_first_obs)) %>%
+  ungroup()
+# Calculating the first observation time for each species, each year, relative to the first sampling time that year at that site
+# This is important because the start of the sampling differs between sites
+species_rel_min = species_rel_min %>%
+  group_by(Species, Year, SiteID) %>%
+  filter(Abundance != 0) %>%
+  mutate(first_obs = min(yday)) %>%
+ungroup() %>%
+  group_by(Species,Year) %>%
+  mutate(min_rel_first_obs_spec = min(rel_first_obs)) %>%
+  ungroup()
+
+species_cens = data.frame(Species = unique(species_rel_min$Species), cens_percent = rep(0, length(unique(species_rel_min$Species))))
+
+for (i in 1:nrow(species_cens)) {
+  S = species_cens[i,]$Species
+  spec_sub = subset(species_rel_min, Species == S)
+  portion_cens = spec_sub %>%
+  distinct(SiteID, Year, first_obs, first_sampling_year_site)
+  
+  cens_percent = 100 *round(nrow(portion_cens[portion_cens$first_obs == portion_cens$first_sampling_year_site,])/nrow(portion_cens), 3)
+  species_cens[i,]$cens_percent = cens_percent
+}
+
+arranged_cens = species_cens %>%
+  arrange(desc(cens_percent))
+
+site_years_present = date_df %>%
+  distinct(Species, SiteID, Year) %>%
+  group_by(Species) %>%
+  summarise(site_years_present = n())
+
+arranged_cens = merge(arranged_cens, site_years_present, by = c("Species"))
+
+site_years_present = date_df %>%
+  distinct(Species, SiteID) %>%
+  group_by(Species) %>%
+  summarise(sites_present = n())
+
+arranged_cens = merge(arranged_cens, site_years_present, by = c("Species"))
+arranged_cens = arranged_cens %>%
+  arrange(desc(cens_percent))
+
+print(arranged_cens)
+hist(species_cens[species_cens$cens_percent > 1,]$cens_percent, breaks = 101, main = "Percent censoring over all species")
+
+```
+
+
+Now to explore for one species of interest the trend of first observation and sampling times. Here, the red point is the first observation time and the blue point is the first sampling time. If there is only a red point in that site-year it means that they are the same time.
+
+```{r}
+S = "Cerastis rubricosa"
+
+spec_sub = subset(species_rel_min, Species == S)
+
+portion_cens = spec_sub %>%
+  distinct(SiteID, Year, first_obs, first_sampling_year_site)
+
+print(paste(100 *round(nrow(portion_cens[portion_cens$first_obs == portion_cens$first_sampling_year_site,])/nrow(portion_cens), 3), "% censored for", S))
+
+for (s in unique(spec_sub$SiteID)) {
+  p1 = ggplot(subset(spec_sub, SiteID == s), aes(x = Year)) +
+    geom_point(aes(y = first_sampling_year_site), color = "blue", size = 3, show.legend = TRUE) +
+    geom_point(aes(y = first_obs), color = "red", size = 3, show.legend = TRUE) +   
+    geom_segment(aes(x = Year, xend = Year, y = first_sampling_year_site, yend = first_obs), color = "black") + 
+    labs(y = "Day of Year") + 
+    coord_cartesian(xlim = c(1997, 2018), ylim = c(min(spec_sub$first_obs, spec_sub$first_sampling_year_site) - 10, max(spec_sub$first_obs, spec_sub$first_sampling_year_site) + 10)) +
+    ggtitle(paste("Site", s, S, "first obs. and first sampling"))
+  
+  print(p1)
+  
+}
+```
+
+
+Now we need to subset the data to our species and process it for the modelling, so we will create a function to get the species data merged to the climate data subsetted for our species:
+
+```{r}
+get_species_subset = function (S) {
+
+  # Load in the updated species data
+  date_df = read.csv('/home/matthorn/Documents/Thesis/species_data/Moth_Monitoring_toRecbase_19072023.csv')
+  date_df = date_df[date_df$Success == 1,]
+  
+  # Take years after 1997 for now (~5 days to rerun climate rasters)
+  date_df = subset(date_df, Year >= 2001)
+  
+  # Compute the unique locations
+  site_location = date_df %>%
+    distinct(SiteID, Latitude, Longitude)
+  
+  date_df$Date = as.Date(paste(date_df$Year, date_df$Month, date_df$Day, sep = "-"))
+  date_df = date_df %>%
+    mutate(yday = yday(Date))
+  
+  # Convert NULL entries (no species found) to species S with zero abundance
+  date_df[date_df$Species == "NULL",]$Species = S
+  date_df[date_df$Abundance == "NULL",]$Abundance = "0"
+  date_df$Abundance = as.numeric(date_df$Abundance)
+  
+  # Get first and last sampling time for each site-year and first observation time for each species at each site-year
+  first_last_samplings = date_df %>%
+    group_by(SiteID, Year) %>%
+    summarise(first_sampling = min(yday),
+              last_sampling = max(yday), .groups = "drop")
+  
+  first_obs = date_df %>%
+    group_by(SiteID, Year, Species) %>%
+    filter(Abundance > 0) %>% # Avoid absences being considered in first observation time
+    summarise(first_obs = min(yday), .groups = "drop")
+  
+  # Load in climate data and merge it with the species data
+  load('/home/matthorn/Documents/Thesis/Dataframes/daily_climate_samples_2001.RData')
+  
+  # Merge the SiteID onto the climate data
+  daily_climate_samples_2001 = merge(daily_climate_samples_2001, site_location, by = c("Longitude", "Latitude", "SiteID"))
+  
+  spec_sub = subset(date_df, Species == S)
+  
+  # Take the first obs for species S
+  first_obs_spec = subset(first_obs, Species == S)
+  
+  # Get all sampling times for each site-year
+  site_year_yday = date_df %>%
+    distinct(SiteID, Year, yday)
+  
+  # Merge all sampling times with first observation times
+  spec_samp_intervals = merge(site_year_yday, first_obs_spec, by = c("SiteID", "Year"))
+  spec_samp_intervals = spec_samp_intervals %>%
+    group_by(Species, SiteID, Year) %>%
+    arrange(Species, SiteID, Year, yday)
+  # Compute the start of the censoring interval, i.e. the sampling time previous to first_obs by site-year
+  spec_samp_intervals_obs = spec_samp_intervals %>%
+    group_by(Species, SiteID, Year) %>%
+    summarise(first_obs = first_obs,
+              int_cens_time = max(yday[yday < first_obs]), .groups = "drop") %>%
+    distinct()
+  
+  # Change -Inf values to zero (they are the left-censored cases and won't be used anyway)
+  spec_samp_intervals_obs[is.infinite(spec_samp_intervals_obs$int_cens_time),]$int_cens_time = 0
+  
+  daily_climate_samples_2001$Species = S
+  
+  # Join the first and last samplings to the climate data by site and year
+  date_climate_df = merge(daily_climate_samples_2001, first_last_samplings, by = c("SiteID", "Year"))
+  date_climate_df = date_climate_df %>%
+    distinct() %>%
+    arrange(SiteID, Year, yday)
+  
+  # Join the first observations by species, site and year
+  date_climate_df = left_join(date_climate_df, spec_samp_intervals_obs, by = c("Species", "SiteID", "Year"))
+  
+  date_climate_df = date_climate_df %>%
+    mutate(Date = as.Date(Date))
+  
+  # Now join all observations in case more than the first observations and first samplings are wanted later
+  date_climate_df = left_join(date_climate_df, spec_sub, by = c("Species", "SiteID", "Date", "Year", "yday", "Month", "Day", "Longitude", "Latitude"))
+  
+  # Get rid of unnecessary columns
+  date_climate_df = date_climate_df %>%
+    subset(select = -c(DatasetID, DatasetTitle, SiteName, SampleEvent, EffortType, Genus, SpeciesEpithet, AbundanceType))
+  
+  # Impute missing effort and abundances
+  date_climate_df[is.na(date_climate_df$Effort),]$Effort = 0
+  date_climate_df[is.na(date_climate_df$Abundance),]$Abundance = 0
+  
+  # Impute missing first observations with 365 which is coded for absence in the entire site-year
+  date_climate_df[is.na(date_climate_df$first_obs),]$first_obs = 365
+  
+  # Remove duplicates from the other species whose names were changed to S, then order the rows by site, year, yday
+  date_climate_df = date_climate_df %>%
+    distinct() %>%
+    arrange(Species, SiteID, Year, yday)
+  
+  # Compute a censoring indicator variable
+  date_climate_df = date_climate_df %>%
+    mutate(censored = ifelse(first_sampling == first_obs, 1, 0))
+  
+  date_climate_df = date_climate_df %>%
+    subset(select = -c(X, Success, TrapType))
+  
+  print(date_climate_df)
+  return(date_climate_df)
+}
+
+```
+
+
+Here, I will check for and remove outliers in both the covariates and the response:
+
+```{r}
+date_climate_df = get_species_subset("Cerastis rubricosa")
+
+first_samp_obs_climate = date_climate_df[date_climate_df$yday == date_climate_df$first_obs,]
+
+hist(first_samp_obs_climate$first_obs, main = "First Observation Times")
+hist(first_samp_obs_climate$first_sampling, main = "First Sampling Times")
+hist(subset(first_samp_obs_climate, first_obs != 365)$first_obs, main = "First Observation Times, excluding absences")
+
+
+# Remove outliers when first observation is super late (for this species)
+# Must leave the first_obs == 365 in the dataset to preserve absences!!
+date_climate_df = date_climate_df[date_climate_df$first_obs < 180 | date_climate_df$first_obs == 365,]
+first_samp_obs_climate = date_climate_df[date_climate_df$yday == date_climate_df$first_obs,]
+
+hist(subset(first_samp_obs_climate, first_obs != 365)$first_obs, main = "First Observation Times excluding absences")
+hist(first_samp_obs_climate$first_sampling, main = "First Sampling Times")
+hist(subset(first_samp_obs_climate, first_obs != 365)$Daily_Min_Temp, main = "First Obs Min Temp excluding absences")
+
+# Remove outliers when the minimum temperature at the first observation time is super low (for this species)
+date_climate_df = date_climate_df[date_climate_df$Daily_Min_Temp > -10 | date_climate_df$first_obs == 365,]
+first_samp_obs_climate = date_climate_df[date_climate_df$yday == date_climate_df$first_obs,]
+
+hist(subset(first_samp_obs_climate, first_obs != 365)$first_obs, main = "First Observation Times excluding absences")
+hist(first_samp_obs_climate$first_sampling, main = "First Sampling Times")
+hist(subset(first_samp_obs_climate, first_obs != 365)$Daily_Min_Temp, main = "First Obs Min Temp excluding absences")
+
+```
+
+Now we create some functions to process the data and return a data list to feed into the STAN model:
+
+```{r}
+# Helper function to calculate aggregate climate measures based on base temperature
+aggregate_climate = function(base_temp, df) {
+  # Compute the aggregate covariates
+  df = df %>%
+  distinct(SiteID, Year, yday, .keep_all = TRUE) %>%
+  arrange(Year, SiteID, yday) %>%
+  mutate(GDD = ifelse(((Daily_Max_Temp - Daily_Min_Temp)/2) > base_temp, (((Daily_Max_Temp - Daily_Min_Temp)/2) - base_temp), 0),
+         chill_days = ifelse(Daily_Min_Temp <= 0 & yday <= 245, 1, 0)) %>%
+  group_by(Year, SiteID) %>%
+  mutate(heat_sum = cumsum(GDD),
+         chill_sum = cumsum(chill_days),
+         cum_rain = cumsum(Daily_Rain))
+  
+  return (df)
+}
+
+# Function to simulate the data based on prior random draws and return the synthetic data with the censoring percentage
+process_species_data = function(df, all_samp_times, fold, artif=FALSE) {
+  # In artificial censoring cases we need to find the new start point of the censoring interval
+  if (artif) {
+    # Get the distinct artificial first obs times per site-year
+    artif_first_obs_spec = df %>%
+      distinct(Species, SiteID, Year, artif_first_obs)
+    
+    # Merge all sampling times with first observation times
+    spec_samp_intervals = merge(all_samp_times, artif_first_obs_spec, by = c("SiteID", "Year"))
+    spec_samp_intervals = spec_samp_intervals %>%
+      group_by(Species, SiteID, Year) %>%
+      arrange(Species, SiteID, Year, yday)
+    # Compute the start of the censoring interval, i.e. the sampling time previous to first_obs by site-year
+    spec_samp_intervals_obs = spec_samp_intervals %>%
+      group_by(Species, SiteID, Year) %>%
+      summarise(artif_int_cens_time = max(yday[yday < artif_first_obs]), .groups = "drop") %>%
+      distinct()
+    
+    # Change -Inf values to zero (they are the left-censored cases and won't be used anyway)
+    spec_samp_intervals_obs[is.infinite(spec_samp_intervals_obs$artif_int_cens_time),]$artif_int_cens_time = 0
+    
+    # Join the interval start points to the rest of the data 
+    df = left_join(df, spec_samp_intervals_obs, by = c("Species", "SiteID", "Year"))
+  }
+  
+  # Get the unique first OBSERVATION times (not occurrences) and start points of the censoring interval over site-years (i.e. one per site-year)
+  times_df = df %>% 
+    distinct(SiteID, Year, first_obs, artif_first_obs, int_cens_time, artif_int_cens_time)
+  if (artif) {
+    time = times_df$artif_first_obs
+    int_cens_time = times_df$artif_int_cens_time
+  } else {
+    time = times_df$first_obs
+    int_cens_time = times_df$int_cens_time
+  }
+  
+  # Get a vector of the censoring indicator variable dynamically depending on the fold
+  cens_df = df %>%
+    distinct(SiteID, Year, censored, cens_fold_1, cens_fold_2, cens_fold_3, cens_fold_4, cens_fold_5)
+  
+  if (artif) {
+    if (fold == 1) {
+      cens = cens_df$cens_fold_1
+    } else if (fold == 2) {
+      cens = cens_df$cens_fold_2
+    } else if (fold == 3) {
+      cens = cens_df$cens_fold_3
+    } else if (fold == 4) {
+      cens = cens_df$cens_fold_4
+    } else if (fold == 5) {
+      cens = cens_df$cens_fold_5
+    } else {
+      print("Error in fold declaration")
+      break
+    }
+  } else {
+    cens = cens_df$censored
+  }
+  
+  # The number of rows in the covariate matrix will be the maximum time of first observation over all site-years in df
+  N = max(time) 
+  
+  # Now get the sites and years from the distinct site-year combinations to feed into the STAN model
+  dist_site_years = df %>%
+    distinct(SiteID, Year)
+  sites_rep = dist_site_years$SiteID
+  years_rep = dist_site_years$Year
+  M = length(sites_rep)
+  
+  # Get the covariate matrices for the model
+  heat_matrix_df = df %>%
+    distinct(SiteID, Year, yday, heat_sum) %>%
+    pivot_wider(names_from = c(SiteID, Year), values_from = heat_sum)
+  heat_matrix_df = heat_matrix_df[1:N,]
+  heat_matrix_df = heat_matrix_df[,2:length(colnames(heat_matrix_df))]
+  
+  heat_matrix_df = heat_matrix_df %>%
+    mutate_all(~ifelse(is.na(.), 0, .))
+
+  frost_matrix_df = df %>%
+    distinct(SiteID, Year, yday, chill_sum) %>%
+    pivot_wider(names_from = c(SiteID, Year), values_from = chill_sum)
+  frost_matrix_df = frost_matrix_df[1:N,]
+  frost_matrix_df = frost_matrix_df[,2:length(colnames(frost_matrix_df))]
+  
+  frost_matrix_df = frost_matrix_df %>%
+    mutate_all(~ifelse(is.na(.), 0, .))
+  
+  min_matrix_df = df %>%
+    distinct(SiteID, Year, yday, Daily_Min_Temp) %>%
+    pivot_wider(names_from = c(SiteID, Year), values_from = Daily_Min_Temp)
+  min_matrix_df = min_matrix_df[1:N,]
+  min_matrix_df = min_matrix_df[,2:length(colnames(min_matrix_df))]
+  
+  min_matrix_df = min_matrix_df %>%
+    mutate_all(~ifelse(is.na(.), 0, .))
+  
+  rain_matrix_df = df %>%
+    distinct(SiteID, Year, yday, cum_rain) %>%
+    pivot_wider(names_from = c(SiteID, Year), values_from = cum_rain)
+  rain_matrix_df = rain_matrix_df[1:N,]
+  rain_matrix_df = rain_matrix_df[,2:length(colnames(rain_matrix_df))]
+  
+  rain_matrix_df = rain_matrix_df %>%
+    mutate_all(~ifelse(is.na(.), 0, .))
+  
+  winter_matrix_df = df %>%
+    distinct(SiteID, Year, yday, winter_mean_temp) %>%
+    pivot_wider(names_from = c(SiteID, Year), values_from = winter_mean_temp)
+  winter_matrix_df = winter_matrix_df[1:N,]
+  winter_matrix_df = winter_matrix_df[,2:length(colnames(winter_matrix_df))]
+  
+  winter_matrix_df = winter_matrix_df %>%
+    mutate_all(~ifelse(is.na(.), 0, .))
+  
+  spring_matrix_df = df %>%
+    distinct(SiteID, Year, yday, spring_mean_temp) %>%
+    pivot_wider(names_from = c(SiteID, Year), values_from = spring_mean_temp)
+  spring_matrix_df = spring_matrix_df[1:N,]
+  spring_matrix_df = spring_matrix_df[,2:length(colnames(spring_matrix_df))]
+  
+  spring_matrix_df = spring_matrix_df %>%
+    mutate_all(~ifelse(is.na(.), 0, .))
+  
+  photo_matrix_df = df %>%
+    distinct(SiteID, Year, yday, photoperiod) %>%
+    pivot_wider(names_from = c(SiteID, Year), values_from = photoperiod)
+  photo_matrix_df = photo_matrix_df[1:N,]
+  photo_matrix_df = photo_matrix_df[,2:length(colnames(photo_matrix_df))]
+  
+  photo_matrix_df = photo_matrix_df %>%
+    mutate_all(~ifelse(is.na(.), 0, .))
+  
+  plant_matrix_df = df %>%
+    distinct(SiteID, Year, yday, plant_phen) %>%
+    pivot_wider(names_from = c(SiteID, Year), values_from = plant_phen)
+  plant_matrix_df = plant_matrix_df[1:N,]
+  plant_matrix_df = plant_matrix_df[,2:length(colnames(plant_matrix_df))]
+  
+  plant_matrix_df = plant_matrix_df %>%
+    mutate_all(~ifelse(is.na(.), 0, .))
+  
+  cens_zeros = 0
+  cens_ones = 0
+  
+  for (k in 1:length(cens)) {
+    if (cens[k] == 0) {
+      cens_zeros = cens_zeros + 1
+    } else {
+      cens_ones = cens_ones + 1
+    }
+  }
+  
+  cens_percent = round(100 * cens_ones / (cens_zeros + cens_ones), 2)
+  
+  print(paste(cens_percent, "%  censored!"))
+  
+  full_model_data = list(N = as.integer(N), M = as.integer(M), cens = as.integer(cens), obs_time = as.integer(time), int_cens_time = , x_heat = heat_matrix_df, x_frost = frost_matrix_df, x_min = min_matrix_df, x_rain = rain_matrix_df, x_spring = spring_matrix_df, x_photo = photo_matrix_df, x_phen = plant_matrix_df)
+  
+  print(paste(M, "site-years and", N, "maximum first observation time"))
+  
+  # Sanity check: these should be empty
+  print(subset(df, censored == 0 & (int_cens_time == 0 | artif_int_cens_time == 0)))
+  print(subset(df, censored == 1 & (int_cens_time != 0 | artif_int_cens_time != 0)))
+  
+  # Return the data list which can be fed into STAN in addition to the portion of censoring
+  return (list(full_model_data, cens_percent))
+}
+
+```
+
+
+A quick look at the priors:
+
+!! priors need updating !! -> interval censoring changes htings and need to find priors for photo and plant. Also try one more time non-negative priors !!
+
+```{r}
+x = seq(-2, 2, length.out = 300)
+x_int = seq(-50, 0, length.out = 1000)
+y_int = dnorm(x_int, mean = -20, sd = 10)
+y_heat = dnorm(x, 0, 0.25)
+y_frost = dnorm(x, mean = 0, sd = 0.25)
+y_min = dnorm(x, 0, 0.25)
+y_rain = dnorm(x, mean = 0, sd = 0.1)
+y_spring = dnorm(x, mean = 0, sd = 1)
+y_photo = dnorm(x, mean = 0, sd = 0.25)
+y_plant = dnorm(x, mean = 0, sd = 0.25)
+
+
+plot(x_int, y_int, type = "l", main = "Intercept")
+plot(x, y_heat, type = "l", main = "Cumulative Growing-Degree-Days")
+plot(x, y_frost, type = "l", main = "Cumulative chilling days")
+plot(x, y_min, type = "l", main = "Daily Minimum Temperature")
+plot(x, y_rain, type = "l", main = "Cumulative Rainfall")
+plot(x, y_spring, type = "l", main = "Mean Spring Temperature")
+plot(x, y_photo, type = "l", main = "Photoperiod")
+plot(x, y_plant, type = "l", main = "Plant Phenology; Start of Season")
+
+```
+
+
+Now we need to use diagnostics to infer plausible ranges for the base temperature of our chosen species. This will be further narrowed down to a single most probable base temperature through model comparison. See thesis paper for explanation (Section Materials and Methods: Covariate Diagnostics).
+
+```{r}
+# Find a maximum threshold for the base temperature by making sure heat accumulates in every site-year in the data
+threshold_df = date_climate_df[date_climate_df$yday == date_climate_df$first_obs,]
+max_base_temp = max(date_climate_df$Daily_Mean_Temp)
+
+print(paste("Base temp must be lower than", floor(max_base_temp), "to accumulate heat in all site-years"))
+
+# Iterate through plausible base temperatures based on literature range of [-10, 15] for Finnish  moths and the max_base_temp found just above, as well as initial exploration (this is an iterative process, until I need to automate it)
+base_temp_range = seq(-10, 5)
+
+for (b in base_temp_range) {
+  base_temp = b
+  
+  # Calculate cumulative GDD for this base temperature and a CDF normalized by the heat_sum at the first observation time
+  base_temp_df = date_climate_df %>%
+    distinct(SiteID, Year, yday, .keep_all = TRUE) %>%
+    arrange(Year, SiteID, yday) %>%
+    mutate(GDD = ifelse(((Daily_Max_Temp - Daily_Min_Temp)/2) > base_temp, (((Daily_Max_Temp - Daily_Min_Temp)/2) - base_temp), 0)) %>%
+    group_by(Year, SiteID) %>%
+    mutate(heat_sum = cumsum(GDD),
+           heat_max = ifelse(yday == first_obs, heat_sum, 0),
+           heat_first_obs = max(heat_max),
+           cdf_heat = heat_sum / heat_first_obs)
+  
+  # Exclude absences from plot
+  base_temp_df = subset(base_temp_df, first_obs != 365)
+  
+  # Define three quantiles of the heat sum CDF
+  p1 = 0.5
+  p2 = 0.7
+  p3 = 0.9
+  
+  # Find the yday closest to where the CDF equals those quantiles
+  quantile_df = base_temp_df %>%
+    group_by(SiteID, Year) %>%
+    summarise(p1_day = yday[which.min(abs(cdf_heat - p1))],
+              p2_day = yday[which.min(abs(cdf_heat - p2))],
+              p3_day = yday[which.min(abs(cdf_heat - p3))],
+              first_obs = max(first_obs), .groups = "drop")
+  
+  # Plot these ydays against the first observation time
+  print(ggplot(quantile_df, aes(x = first_obs, y = p1_day)) +
+          geom_point() +
+          geom_smooth(method = "lm", formula = y ~ x) +
+          labs(x = "first obs time", y = paste(p1, "quantile yday")) +
+          ggtitle(paste(p1, "quantile plot, base temp =", b)))
+  
+    print(ggplot(quantile_df, aes(x = first_obs, y = p2_day)) +
+          geom_point() +
+          geom_smooth(method = "lm", formula = y ~ x) +
+          labs(x = "first obs time", y = paste(p2, "quantile yday")) +
+          ggtitle(paste(p2, "quantile plot, base temp =", b)))
+    
+      print(ggplot(quantile_df, aes(x = first_obs, y = p3_day)) +
+          geom_point() +
+          geom_smooth(method = "lm", formula = y ~ x) +
+          labs(x = "first obs time", y = paste(p3, "quantile yday")) +
+          ggtitle(paste(p3, "quantile plot, base temp =", b)))
+      
+      # Finally plot the heat accumulation curves with replicates across site-years for each base temperature to get an idea of the magnitude and curvature
+      print(ggplot(base_temp_df, aes(x = yday, y = heat_sum, group = interaction(SiteID, Year), color = SiteID)) +
+              geom_line() +
+              labs(x = "Day of Year", y = "Heat Sum") +
+              ggtitle(paste("Base Temp.", b, "Cumulative GDD curves across site-years")))
+  
+}
+```
+
+
+-10 through 0 all have quite similar fits. If we want to save time we could try -5 through 0, for example.
+
+```{r}
+base_temp_set = seq(-10, 0)
+```
+
+
+Now let's split the data into 5 folds for cross validation and also assign a censoring value for each test site-year. Now we feed cens_fold_i into STAN as the cens variable depending on what fold we are testing, and the time variable will be first_obs in the regular cross validation case, and artif_first_obs in the artificially censoring case.
+
+```{r}
+# Take distinct site-years that were uncensored as the test data
+model_data = date_climate_df
+model_site_years = model_data[model_data$censored == 0,] %>%
+  distinct(SiteID, Year)
+
+# Create a fold column and merge it back onto original data frame
+n_ind = nrow(model_site_years)
+fold_length = floor(n_ind / 5)
+
+# Get the remainder, i.e. the site-years that don't fit neatly into 5 folds
+fold_remainder = n_ind %% 5
+fold_ind = rep(1:5, each = fold_length)
+
+# Assign the remainder observations to random folds
+fold_ind = c(fold_ind, sample(1:5, fold_remainder, replace = TRUE))
+
+shuffled_fold_ind = fold_ind[sample(length(fold_ind))]
+model_site_years$fold = shuffled_fold_ind
+
+model_data = left_join(model_data, model_site_years, by = c("SiteID", "Year"))
+# fold 0 codes for censored data which is always in the training set
+model_data[is.na(model_data$fold),]$fold = 0
+
+# Create artificial censoring of uncensored test points in all folds
+# artif_first_obs and combined_cens will now be what we feed into STAN as the time and cens variables with the training data
+model_data = model_data %>%
+  mutate(artif_first_samp = ifelse(fold > 0, first_obs + floor(abs(rnorm(1, mean=0, sd=10))), first_sampling), # Create artificial first sampling for uncensored cases
+         artif_first_obs = ifelse(first_obs > artif_first_samp, first_obs, artif_first_samp),
+         artif_first_obs = ifelse(artif_first_obs > 365, 365, artif_first_obs), # Don't allow absences to get an artificial first sampling of greater than 365
+         artif_cens = ifelse(artif_first_obs < artif_first_samp, 1, 0),
+         artif_cens = ifelse(first_obs == 365, 0, artif_cens), # Don't allow absences to be censored
+         cens_fold_1 = as.numeric(fold == 1 | censored),
+         cens_fold_2 = as.numeric(fold == 2 | censored),
+         cens_fold_3 = as.numeric(fold == 3 | censored),
+         cens_fold_4 = as.numeric(fold == 4 | censored),
+         cens_fold_5 = as.numeric(fold == 5 | censored))
+
+print(model_data)
+
+```
+
+
+Now I will create a function that takes this data as input in computes the RMSE and LPD in both the regular and artifically censored cases. I will collect a data frame where each site-year in the test data is included, with replicates over fold. I am designing things to be done manually as far as the coding of what model and covariates are being used. This is to avoid the tedium of abstracting away the model selection and considering all paths the feature selection might take. However, for the selection of the base temperature, it is straightforward because the model stays the same and only the processing of the heat term changes.
+
+I'm going to define two functions to get the predicted first occurrence times, in both the regular CV case and censored CV (CCV) case. Depending on the model, some of these arguments will default to zero
+
+!! How to handle cases when outcome is all zero for every yday in a site-year? How to even compute the error?? Not possible, since yday would be, say, 150 and we don't predict a day for the first occurrence?
+
+```{r}
+# Function to get the MCMC sample for predicted first occurrences over all site-years; regular CV over uncensored site-years
+get_pred_samples_CV = function(data, intercept, beta_heat, beta_frost=0, beta_min=0, beta_rain=0, beta_spring=0) {
+    # Compute daily probabilities based on a logit link and outcomes based on a bernoulli random variable using the probabilities as input
+  min_yday_event = data %>%
+    mutate(p_pred = exp(intercept + beta_heat*heat_sum + beta_frost*chill_sum + beta_min*Daily_Min_Temp + beta_rain*cum_rain + beta_spring*spring_mean_temp)/(1 + exp(intercept + beta_heat*heat_sum + beta_frost*chill_sum + beta_min*Daily_Min_Temp + beta_rain*cum_rain + beta_spring*spring_mean_temp)),
+           p_pred = ifelse(is.na(p_pred), 0, p_pred), # Convert NA values to zero probability (underflow errors)
+           pred_outcome = rbinom(n(), size=1, prob = p_pred)) %>% # Draw outcome from Bernoulli random variable
+    group_by(SiteID, Year) %>%
+    filter(pred_outcome == 1) %>%
+    summarise(pred_first_occurrence_time = min(yday), .groups = "drop")
+  
+  return (min_yday_event)
+}
+
+# Function to get the MCMC sample for predicted first occurrences over all site-years; Censored CV over artificially censored fold
+get_pred_samples_CCV = function(data, intercept, beta_heat, beta_frost=0, beta_min=0, beta_rain=0, beta_spring=0) {
+    # Compute daily probabilities based on a logit link and outcomes based on a bernoulli random variable using the probabilities as input
+  min_yday_event = data %>%
+    mutate(p_pred = exp(intercept + beta_heat*heat_sum + beta_frost*chill_sum + beta_min*Daily_Min_Temp + beta_rain*cum_rain + beta_spring*spring_mean_temp)/(1 + exp(intercept + beta_heat*heat_sum + beta_frost*chill_sum + beta_min*Daily_Min_Temp + beta_rain*cum_rain + beta_spring*spring_mean_temp)),
+           p_pred = ifelse(is.na(p_pred), 0, p_pred)) %>% # Convert NA values to zero probability (underflow errors)
+    filter(yday <= artif_first_samp) %>%
+    group_by(SiteID, Year) %>%
+    summarise(pred_first_occurrence_time = sample(yday, 1, prob = p_pred), .groups = "drop") # Sample one day for first occurrence out of days prior to the censoring point
+  
+  return (min_yday_event)
+}
+
+```
+
+
+```{r}
+# Get all sampling times for each site-year
+site_year_yday = date_df %>%
+  distinct(SiteID, Year, yday)
+```
+
+
+```{r}
+# Set up a data frame to collect the results
+model1_results = data.frame(model = rep(1, 5), fold = seq(1, 5), RMSE = rep(0, 5), LPD = rep(0, 5), artif_RMSE = rep(0, 5), artif_LPD = rep(0, 5))
+model2_results = data.frame(model = rep(2, 5), fold = seq(1, 5), RMSE = rep(0, 5), LPD = rep(0, 5), artif_RMSE = rep(0, 5), artif_LPD = rep(0, 5))
+
+first_df = model_data %>%
+  distinct(SiteID, Year, first_obs)
+
+print(paste("Model comparison started at", Sys.time()))
+
+# Run for each fold
+for (j in 1:5) {
+  print(paste("Starting fold", j, "training and validation..."))
+  
+  # Get training and testing sets
+  training_data1 = aggregate_climate(base_temp_set[1], model_data[model_data$fold != j,])
+  training_data2 = aggregate_climate(base_temp_set[2], model_data[model_data$fold != j,])
+  test_data1 = aggregate_climate(base_temp_set[1], model_data[model_data$fold == j,])
+  test_data2 = aggregate_climate(base_temp_set[2], model_data[model_data$fold == j,])
+  
+  # Process model data for STAN with two different models
+  data_list1 = process_species_data(training_data1, site_year_yday, fold=j, artif=FALSE)
+  data_list2 = process_species_data(training_data2, site_year_yday, fold=j, artif=FALSE)
+  stan_data1 = data_list1[[1]]
+  stan_data2 = data_list2[[1]]
+  
+  print("Starting training of regular CV models...")
+  
+  real_fit1 = stan(file="/home/matthorn/Documents/Thesis/curr_mod1_int_cens.stan", model_name=paste("heat_model: base temp =", base_temp_set[1], S), data=stan_data1, iter=500, chains=2, cores = 2)
+  real_fit2 = stan(file="/home/matthorn/Documents/Thesis/curr_mod2_int_cens.stan", model_name=paste("heat_model: base temp =", base_temp_set[2], S), data=stan_data2, iter=500, chains=2, cores = 2)
+  
+  # Get the MCMC samples from the model fit for the intercept and linear term
+  full_samples1 = as.matrix(real_fit1, pars = c("alpha", "Beta_heat"))
+  full_samples2 = as.matrix(real_fit2, pars = c("alpha", "Beta_heat"))
+  
+  # Get the number of samples
+  num_samples = nrow(full_samples1)
+  
+  # Create a dataframe to store the posterior predictive distributions
+  pred_df1 = data.frame(SiteID = numeric(), Year = numeric(), pred_first_occurrence_time = numeric())
+  pred_df2 = data.frame(SiteID = numeric(), Year = numeric(), pred_first_occurrence_time = numeric())
+  
+  print("Running predictions...")
+  
+  # For each sample, get the predicted first occurrence time for each uncensored site-year and store these iteratively in pred_df
+  for (i in 1:num_samples) {
+    res1 = get_pred_samples_CV(test_data1, full_samples1[i,1], full_samples1[i,2], 0, 0, 0, 0)
+    pred_df1 = rbind(pred_df1, res1)
+    
+    res2 = get_pred_samples_CV(test_data2, full_samples2[i,1], full_samples2[i,2], 0, 0, 0, 0)
+    pred_df2 = rbind(pred_df2, res2)
+  }
+  
+  # Merge first occurrence times into prediction results
+  pred_df1 = merge(pred_df1, first_df, by = c("SiteID", "Year"))
+  pred_df2 = merge(pred_df2, first_df, by = c("SiteID", "Year"))
+  
+  # Compute the root mean squared error of the predicted first occurrence from the true first observation time
+  pred_df1 = pred_df1 %>%
+    group_by(SiteID, Year) %>%
+    mutate(squared_error = (pred_first_occurrence_time - first_obs)^2) %>%
+    summarise(RMSE = (mean(squared_error))^0.5,
+              LPD = ifelse(sum(pred_first_occurrence_time == first_obs) / n() > 0, log(sum(pred_first_occurrence_time == first_obs) / n()), 0))
+  
+  pred_df2 = pred_df2 %>%
+    group_by(SiteID, Year) %>%
+    mutate(squared_error = (pred_first_occurrence_time - first_obs)^2) %>%
+    summarise(RMSE = (mean(squared_error))^0.5,
+              LPD = ifelse(sum(pred_first_occurrence_time == first_obs) / n() > 0, log(sum(pred_first_occurrence_time == first_obs) / n()), 0))
+  
+  # Take mean over site-years and add this to the model results data frame
+  model1_results[model1_results$fold == j,]$RMSE = mean(pred_df1$RMSE)
+  model2_results[model2_results$fold == j,]$RMSE = mean(pred_df2$RMSE)
+  model1_results[model1_results$fold == j,]$LPD = mean(pred_df1$LPD)
+  model2_results[model2_results$fold == j,]$LPD = mean(pred_df2$LPD)
+  
+  # Now do the same in the artificial CCV case
+  #
+  #
+  
+  # Train on all of the data to test the final use case of the model, which is predicting over data the model has been trained on
+  # Validation is left up to the artificial censoring with true first observation time known
+  training_data1 = aggregate_climate(base_temp_set[1], model_data)
+  training_data2 = aggregate_climate(base_temp_set[2], model_data)
+  
+  # Process model data for STAN
+  data_list1 = process_species_data(training_data1, site_year_yday, fold=j, artif=TRUE)
+  data_list2 = process_species_data(training_data2, site_year_yday, fold=j, artif=TRUE)
+  stan_data1 = data_list1[[1]]
+  stan_data2 = data_list2[[1]]
+  
+  print("Starting training of censor CV (CCV) models...")
+  
+  real_fit1 = stan(file="/home/matthorn/Documents/Thesis/curr_mod1_int_cens.stan", model_name=paste("artif heat_model: base temp =", base_temp_set[1], S), data=stan_data1, iter=500, chains=2, cores = 2)
+  real_fit2 = stan(file="/home/matthorn/Documents/Thesis/curr_mod2_int_cens.stan", model_name=paste("artif heat_model: base temp =", base_temp_set[2], S), data=stan_data2, iter=500, chains=2, cores = 2)
+  
+  # Get the MCMC samples from the model fit for the intercept and linear term
+  full_samples1 = as.matrix(real_fit1, pars = c("alpha", "Beta_heat"))
+  full_samples2 = as.matrix(real_fit2, pars = c("alpha", "Beta_heat"))
+  
+  # Get the number of samples
+  num_samples = nrow(full_samples1)
+  
+  # Create a dataframe to store the posterior predictive distributions
+  pred_df1 = data.frame(SiteID = numeric(), Year = numeric(), pred_first_occurrence_time = numeric())
+  pred_df2 = data.frame(SiteID = numeric(), Year = numeric(), pred_first_occurrence_time = numeric())
+  
+  # For each sample, get the predicted first occurrence time for each artificially censored site-year and store these iteratively in pred_df
+  for (i in 1:num_samples) {
+    res1 = get_pred_samples_CCV(test_data1, full_samples1[i,1], full_samples1[i,2], 0, 0, 0, 0)
+    pred_df1 = rbind(pred_df1, res1)
+    
+    res2 = get_pred_samples_CCV(test_data2, full_samples2[i,1], full_samples2[i,2], 0, 0, 0, 0)
+    pred_df2 = rbind(pred_df2, res2)
+  }
+  
+  # Merge first occurrence times into prediction results
+  pred_df1 = merge(pred_df1, first_df, by = c("SiteID", "Year"))
+  pred_df2 = merge(pred_df2, first_df, by = c("SiteID", "Year"))
+  
+  # Compute the root mean squared error of the predicted first occurrence from the true first observation time
+  pred_df1 = pred_df1 %>%
+    group_by(SiteID, Year) %>%
+    mutate(artif_squared_error = (pred_first_occurrence_time - first_obs)^2) %>%
+    summarise(artif_RMSE = (mean(artif_squared_error))^0.5,
+              artif_LPD = ifelse(sum(pred_first_occurrence_time == first_obs) / n() > 0, log(sum(pred_first_occurrence_time == first_obs) / n()), 0))
+  
+  pred_df2 = pred_df2 %>%
+    group_by(SiteID, Year) %>%
+    mutate(artif_squared_error = (pred_first_occurrence_time - first_obs)^2) %>%
+    summarise(artif_RMSE = (mean(artif_squared_error))^0.5,
+              artif_LPD = ifelse(sum(pred_first_occurrence_time == first_obs) / n() > 0, log(sum(pred_first_occurrence_time == first_obs) / n()), 0))
+  
+  # Take mean over site-years and add this to the model results data frame
+  model1_results[model1_results$fold == j,]$artif_RMSE = mean(pred_df1$artif_RMSE)
+  model2_results[model2_results$fold == j,]$artif_RMSE = mean(pred_df2$artif_RMSE)
+  model1_results[model1_results$fold == j,]$artif_LPD = mean(pred_df1$artif_LPD)
+  model2_results[model2_results$fold == j,]$artif_LPD = mean(pred_df2$artif_LPD)
+  
+}
+
+# Summarise the results by taking mean across folds, compare two models in printed result
+fivefold_results_df = rbind(model1_results, model2_results)
+fivefold_results_df = fivefold_results_df %>%
+  group_by(model) %>%
+  summarise(RMSE = mean(RMSE), LPD = mean(LPD), artif_RMSE = mean(artif_RMSE), artif_LPD = mean(artif_LPD))
+
+print(fivefold_results_df)
+print("Validation complete!")
+
+# Decide which model was better based on the results
+winner = "Model 1"
+model1_votes = 0
+model2_votes = 0
+
+if (fivefold_results_df[fivefold_results_df$model == 1,]$RMSE < fivefold_results_df[fivefold_results_df$model == 2,]$RMSE) {
+  model1_votes = model1_votes + 1
+} else {
+  model2_votes = model2_votes + 1
+}
+
+if (fivefold_results_df[fivefold_results_df$model == 1,]$LPD > fivefold_results_df[fivefold_results_df$model == 2,]$LPD) {
+  model1_votes = model1_votes + 1
+} else {
+  model2_votes = model2_votes + 1
+}
+
+if (fivefold_results_df[fivefold_results_df$model == 1,]$artif_RMSE < fivefold_results_df[fivefold_results_df$model == 2,]$artif_RMSE) {
+  model1_votes = model1_votes + 1
+} else {
+  model2_votes = model2_votes + 1
+}
+
+if (fivefold_results_df[fivefold_results_df$model == 1,]$artif_LPD > fivefold_results_df[fivefold_results_df$model == 2,]$artif_LPD) {
+  model1_votes = model1_votes + 1
+} else {
+  model2_votes = model2_votes + 1
+}
+
+if (model1_votes > model2_votes) {
+  winner = "Model 1"
+} else if (model2_votes > model1_votes) {
+  winner = "Model 2"
+} else {
+  print("Tie in the votes, further criteria needed...")
+  if (fivefold_results_df[fivefold_results_df$model == 1,]$artif_RMSE < fivefold_results_df[fivefold_results_df$model == 2,]$artif_RMSE & fivefold_results_df[fivefold_results_df$model == 1,]$artif_LPD > fivefold_results_df[fivefold_results_df$model == 2,]$artif_LPD) {
+    print("Model 1 performed better in both censoring validation criteria")
+    winner = "Model 1"
+  } else if (fivefold_results_df[fivefold_results_df$model == 1,]$artif_RMSE > fivefold_results_df[fivefold_results_df$model == 2,]$artif_RMSE & fivefold_results_df[fivefold_results_df$model == 1,]$artif_LPD < fivefold_results_df[fivefold_results_df$model == 2,]$artif_LPD) {
+    print("Model 2 performed better in both censoring validation criteria")
+    winner = "Model 2"
+  } else {
+    if (fivefold_results_df[fivefold_results_df$model == 1,]$artif_LPD > fivefold_results_df[fivefold_results_df$model == 1,]$artif_LPD) {
+      print("Model 1 was chosen by artif_LPD alone")
+      winner = "Model 1"
+    } else {
+      print("Model 2 was chosen by artif_LPD alone")
+      winner = "Model 2"
+    }
+  }
+}
+
+  
+print(paste(winner, "was the better model!"))
+print(paste("Model comparison ended at", Sys.time()))
+
+```
+
+
+
+######
+
+
+
+

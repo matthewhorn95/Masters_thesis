@@ -1,0 +1,317 @@
+---
+title: "Thesis_covariate_extraction"
+author: "Matthew Horn"
+date: "2024-02-20"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Begin data processing, covariate extraction
+
+First, after loading necessary libraries, I will load the monitoring data for the moth dataset and extract the daily climate data from the rasters provided by the FMI (Finnish Meteorological Institute):
+
+```{r}
+# Loading the necessary libraries first
+library(reshape2)
+library(rstanarm)
+library(rstan)
+library(meteor)
+library(spatstat)
+library(raster)
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(sp)
+library(MASS)
+library(cowplot)
+library(tidyr)
+library(suncalc)
+library(rgdal)
+library(sf)
+library(terra)
+library(zoo)
+```
+
+
+Set the working directory (?? doesn't seem to be working??) -> 
+
+## NOTE: if you are using my work, either remove the path to thesis in all of the file paths if you can get setwd to work and use the relative paths, or use control F to replace my path to the Thesis folder with yours for all occurrences in each Rmd file.
+
+```{r}
+#setwd('/home/matthorn/Documents/Thesis/')
+```
+
+
+```{r}
+# Reading in the data frame for the original observations
+orig_df = read.csv('/home/matthorn/Documents/Thesis/species_data/Moth_Monitoring_toRecbase_19072023.csv')
+head(orig_df)
+```
+
+
+Now getting columns for date and day of year and getting a dataframe with the unique coordinates and first sampling times (each site-year) from this data:
+
+```{r}
+# Get dates of the sampling/observation times and day of year in yday
+date_df = orig_df 
+date_df$Date = as.Date(paste(date_df$Year, date_df$Month, date_df$Day, sep = "-"))
+date_df = date_df %>%
+  mutate(yday = yday(Date))
+
+# Get the first presences of each site-year combination
+first_pres = date_df %>%
+  group_by(SiteID, Year, Species) %>%
+  mutate(first_pres = min(yday)) %>%
+  distinct(Species, SiteID, Year, first_pres) %>%
+  mutate(yday = first_pres)
+
+print(first_pres)
+
+# Getting the unique coordinates and site ID's of the sampling locations for later
+unique_coords = unique(cbind(date_df$Longitude, date_df$Latitude))
+unique_site_coords_df = data.frame(unique(cbind(date_df$SiteID, date_df$Longitude, date_df$Latitude)))
+colnames(unique_site_coords_df) = c("SiteID", "Longitude", "Latitude")
+
+# Also get the first sampling times so we can use the real censoring process in the simulation study
+first_samplings = date_df %>%
+  group_by(Year, SiteID) %>%
+  summarise(first_sampling = min(yday), .groups = "drop")
+```
+
+
+We will now get the daily values from the climate rasters at the observation locations (which will also be the simulation locations), for every day from 1990 Jan. 1st (3 years before the study period) to the final day of 2018, the last year of the study period. We can then calculate what aggregate covariates we wish from those daily values.
+
+```{r}
+# Dates for daily rasters
+date_grid = seq.Date(from = as.Date("1993-01-01"), to = as.Date("2018-12-31"), by = "1 day")
+```
+
+
+```{r}
+# Create vectors of x and y coordinates
+x =  unique_coords[,1]
+y = unique_coords[,2]
+
+# Create a data frame with combinations of coordinate pairs and dates from date_grid
+daily_climate_samples = expand.grid(coords = paste0("(", x, ", ", y, ")"), date = date_grid)
+daily_climate_samples$date = as.character(daily_climate_samples$date)
+daily_climate_samples$coords = gsub("\\(|\\)", "", daily_climate_samples$coords)
+
+daily_climate_samples = cbind(do.call(rbind, strsplit(as.character(daily_climate_samples$coords), ", ")), daily_climate_samples[, c("date")])
+# Convert to data frame
+daily_climate_samples_df = data.frame(daily_climate_samples)
+# Rename the columns
+colnames(daily_climate_samples_df) = c("Longitude", "Latitude", "Date")
+
+# Convert 'x' and 'y' columns to numeric
+daily_climate_samples_df$Longitude = as.numeric(daily_climate_samples_df$Longitude)
+daily_climate_samples_df$Latitude = as.numeric(daily_climate_samples_df$Latitude)
+
+# Create columns for Temperature and Rainfall
+daily_climate_samples_df$Daily_Mean_Temp = NA
+daily_climate_samples_df$Daily_Rain = NA
+daily_climate_samples_df$Daily_Snow = NA
+daily_climate_samples_df$Daily_Min_Temp = NA
+daily_climate_samples_df$Daily_Max_Temp = NA
+
+
+```
+
+```{r}
+# Use these spatial coordinates for every year to get all locations over the entire study period, even if site were dropped/added
+unique_coords = unique(cbind(date_df$Longitude, date_df$Latitude))
+daily_samples_sp = SpatialPoints(unique_coords, CRS("+proj=utm +zone=35 +ellps=GRS80 +units=m +no_defs"))
+```
+
+
+
+```{r}
+# Loop through times and extract raster data at spatial locations
+for (date in date_grid) {
+  # Get the date and print out some diagnostics
+  date = as.Date(date)
+  print(date)
+  print(Sys.time())
+  
+  # Get the daily rasters
+  temp_raster = raster(paste('/home/matthorn/Documents/data_daily/environmental_data/climate/daily_mean_temp/tday_', as.character(year(date)),'.tif', sep = ""), band = as.numeric(yday(date)))
+  rain_raster = raster(paste('/home/matthorn/Documents/data_daily/environmental_data/climate/daily_precip/rrday_', as.character(year(date)), '.tif', sep = ""), band = as.numeric(yday(date)))
+  snow_raster = raster(paste('/home/matthorn/Documents/data_daily/environmental_data/climate/daily_snow/snow_', as.character(year(date)),'.tif', sep = ""), band = as.numeric(yday(date)))
+  min_raster = raster(paste('/home/matthorn/Documents/data_daily/environmental_data/climate/daily_min_temp/tmin_', as.character(year(date)), '.tif', sep = ""), band = as.numeric(yday(date)))
+  max_raster = raster(paste('/home/matthorn/Documents/data_daily/environmental_data/climate/daily_max_temp/tmax_', as.character(year(date)), '.tif', sep = ""), band = as.numeric(yday(date)))
+  
+  # Extract the values for the year
+  temp_vals = extract(temp_raster, daily_samples_sp)
+  rain_vals = extract(rain_raster, daily_samples_sp)
+  snow_vals = extract(snow_raster, daily_samples_sp)
+  min_vals = extract(min_raster, daily_samples_sp)
+  max_vals = extract(max_raster, daily_samples_sp)
+  
+
+  # Insert the daily values into data frame
+  daily_climate_samples_df$Daily_Mean_Temp[daily_climate_samples_df$Date == date] = temp_vals
+  daily_climate_samples_df$Daily_Rain[daily_climate_samples_df$Date == date] = rain_vals
+  daily_climate_samples_df$Daily_Snow[daily_climate_samples_df$Date == date] = snow_vals
+  daily_climate_samples_df$Daily_Max_Temp[daily_climate_samples_df$Date == date] = max_vals
+  daily_climate_samples_df$Daily_Min_Temp[daily_climate_samples_df$Date == date] = min_vals
+
+}
+
+daily_climate_samples_df = daily_climate_samples_df %>%
+  mutate(Year = year(Date),
+         Month = month(Date),
+         Day = day(Date),
+         yday = yday(Date))
+
+daily_climate_samples_df = merge(daily_climate_samples_df, unique_site_coords_df, by = c("Longitude", "Latitude"))
+daily_climate_samples_df$Date = as.Date(daily_climate_samples_df$Date)
+
+save(daily_climate_samples_df, file = '/home/matthorn/Documents/Thesis/daily_climate_samples_df_thesis.RData')
+
+```
+
+
+A quick sanity check comparing the loaded data to the original raster itself:
+
+```{r}
+ggplot(subset(daily_climate_samples_df, Date == as.Date("1997-05-30")), aes(x = Longitude, y = Latitude, color = Daily_Mean_Temp)) +
+  geom_point()
+```
+
+```{r}
+test_day_rast = raster('/home/matthorn/Documents/data_daily/environmental_data/climate/daily_mean_temp/tday_1997.tif', band = 150)
+plot(test_day_rast, colNA="grey40")
+```
+
+
+Looks the same, so the data frame is being filled out with the correct values in the right locations.
+
+# Now let's extract the start of season (measured by deciduous plant phenology) at the sampling sites
+
+
+```{r}
+load('/home/matthorn/Documents/Thesis/daily_climate_samples_df_updated.RData')
+daily_climate_samples_2001 = subset(daily_climate_samples_df, Year >= 2001)
+print(daily_climate_samples_2001)
+```
+
+
+
+
+```{r}
+# Now we only have annual values
+year_grid = seq(2001, 2018)
+```
+
+```{r}
+daily_climate_samples_2001$plant_phen = NA
+```
+
+
+```{r}
+# Loop through times and extract raster data at spatial locations
+for (year in year_grid) {
+  # Get the date and print out some diagnostics
+  print(year)
+  print(Sys.time())
+  
+  # Get the daily rasters
+  phen_raster = raster(paste('/home/matthorn/Documents/Thesis/covariates/DeciduousStartofSeason_', as.character(year),'.tif', sep = ""))
+  phen_values = extract(phen_raster, daily_samples_sp)
+  plot(phen_raster, main = paste(year))
+  
+  # Check for NA values in the raster
+  contains_na = FALSE
+  for (i in 1:length(phen_values)) {
+    if (is.na(phen_values[i])) {
+      contains_na = TRUE
+    }
+  }
+
+  # Impute the NA values using the nearby ones until there are no more
+  while (contains_na) {
+    # Impute the NA values
+    phen_raster = focal(phen_raster, fun=mean, w=matrix(1, nrow=3, ncol=3), na.rm=TRUE, NAonly=TRUE)
+    phen_values = extract(phen_raster, daily_samples_sp)
+    contains_na = FALSE
+    plot(phen_raster, main = paste(year))
+    
+    # Check again for NA's in the imputed raster
+    for (i in 1:length(phen_values)) {
+      if (is.na(phen_values[i])) {
+        contains_na = TRUE
+      }
+    }
+  }
+  
+  print(phen_values)
+  
+  # Insert the daily values into data frame
+  daily_climate_samples_2001[daily_climate_samples_2001$Year == year,]$plant_phen = phen_vals
+}
+
+# Convert the plant phenology variable to integer valued
+daily_climate_samples_2001 = daily_climate_samples_2001 %>%
+  mutate(plant_phen = as.integer(plant_phen))
+print(daily_climate_samples_2001)
+
+# Merge the sites into the climate data
+daily_climate_samples_2001 = merge(daily_climate_samples_2001, unique_site_coords_df, by = c("Longitude", "Latitude"))
+
+# Save the file
+save(daily_climate_samples_2001, file = '/home/matthorn/Documents/Thesis/daily_climate_samples_2001.RData')
+```
+
+
+Sanity Check
+
+```{r}
+ggplot(subset(daily_climate_samples_2001, Year == 2018), aes(x = Longitude, y = Latitude, color = plant_phen)) +
+  geom_point()
+
+test_day_rast = raster('/home/matthorn/Documents/Thesis/covariates/DeciduousStartofSeason_2018.tif')
+plot(test_day_rast)
+```
+
+
+```{r}
+load('/home/matthorn/Documents/Thesis/Dataframes/daily_climate_samples_2001.RData')
+head(daily_climate_samples_2001)
+```
+
+```{r}
+local_coords = SpatialPoints(coords = cbind(daily_climate_samples_2001$Longitude, daily_climate_samples_2001$Latitude), proj4string = CRS("+proj=utm +zone=35 +ellps=GRS80 +units=m +no_defs"))
+
+# Define the target coordinate system (WGS84 - latitude and longitude)
+target_crs = CRS("+proj=longlat +datum=WGS84")
+
+# Transform the coordinates from the source CRS to the target CRS
+global_coords = spTransform(local_coords, target_crs)
+global_longitude = coordinates(global_coords)[,1]
+global_latitude = coordinates(global_coords)[,2]
+
+daily_climate_samples_2001$global_longitude = global_longitude
+daily_climate_samples_2001$global_latitude = global_latitude
+
+daily_climate_samples_2001 = daily_climate_samples_2001 %>%
+  mutate(photoperiod = photoperiod(yday, global_latitude)) %>%
+  group_by(SiteID, Year) %>%
+  mutate(winter_mean_temp = mean(Daily_Mean_Temp[Month %in% c(1, 2)]),
+         spring_mean_temp = mean(Daily_Mean_Temp[Month %in% c(3, 4, 5)]))
+
+head(daily_climate_samples_2001)
+dim(daily_climate_samples_2001)
+colnames(daily_climate_samples_2001)
+save(daily_climate_samples_2001, file = '/home/matthorn/Documents/Thesis/Dataframes/daily_climate_samples_2001.RData')
+```
+
+
+```{r}
+ggplot(subset(daily_climate_samples_2001, Year == 2002 & SiteID == 201), aes(x = yday, y = photoperiod)) +
+  geom_point() +
+  ggtitle("Photoperiod for site 201 in year 2002")
+```
+
